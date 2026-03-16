@@ -6,6 +6,10 @@
 #include <cstring>
 #include <dispatch/dispatch.h>
 
+#ifndef kAudioUnitProperty_AUAudioUnit
+#define kAudioUnitProperty_AUAudioUnit 11000
+#endif
+
 // GUI implementation structure
 struct RackAUGui {
     AudioComponentInstance audio_unit;

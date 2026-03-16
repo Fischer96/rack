@@ -9,6 +9,7 @@
 // GUI implementation structure
 struct RackAUGui {
     AudioComponentInstance audio_unit;
+    AUAudioUnit* au_audio_unit;         // Keep AUv3 instance alive while the editor is open
     NSViewController* view_controller;  // For AUv3
     NSView* view;                      // For AUv2 or generic UI
     NSWindow* window;                  // Optional window for standalone display
@@ -237,20 +238,20 @@ static NSView* create_generic_ui(AudioComponentInstance audio_unit, NSMutableArr
 
 static void try_load_auv3_gui(
     AudioComponentInstance audio_unit,
-    void (^completion)(AUViewControllerBase* viewController)
+    void (^completion)(AUViewControllerBase* viewController, AUAudioUnit* auAudioUnit)
 ) {
     @autoreleasepool {
         // Get the AudioComponent from the instance
         AudioComponent component = AudioComponentInstanceGetComponent(audio_unit);
         if (component == NULL) {
-            completion(nil);
+            completion(nil, nil);
             return;
         }
 
         // Get component description to instantiate AUv3
         AudioComponentDescription desc;
         if (AudioComponentGetDescription(component, &desc) != noErr) {
-            completion(nil);
+            completion(nil, nil);
             return;
         }
 
@@ -260,14 +261,14 @@ static void try_load_auv3_gui(
                                         completionHandler:^(AUAudioUnit* _Nullable auAudioUnit, NSError* _Nullable error) {
             if (error != nil || auAudioUnit == nil) {
                 // Not an AUv3 plugin or instantiation failed
-                completion(nil);
+                completion(nil, nil);
                 return;
             }
 
             // Request view controller asynchronously
             [auAudioUnit requestViewControllerWithCompletionHandler:^(AUViewControllerBase* _Nullable viewController) {
                 // viewController will be nil if plugin has no GUI
-                completion(viewController);
+                completion(viewController, auAudioUnit);
             }];
         }];
     }
@@ -379,11 +380,12 @@ void rack_au_gui_create_async(
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
             // Try AUv3 GUI first (asynchronous)
-            try_load_auv3_gui(audio_unit, ^(AUViewControllerBase* viewController) {
+            try_load_auv3_gui(audio_unit, ^(AUViewControllerBase* viewController, AUAudioUnit* auAudioUnit) {
                 if (viewController != nil) {
                     // AUv3 succeeded
                     RackAUGui* gui = new RackAUGui();
                     gui->audio_unit = audio_unit;
+                    gui->au_audio_unit = auAudioUnit;
                     gui->view_controller = viewController;
                     gui->view = viewController.view;
                     gui->window = nil;
@@ -401,6 +403,7 @@ void rack_au_gui_create_async(
                         // AUv2 succeeded
                         RackAUGui* gui = new RackAUGui();
                         gui->audio_unit = audio_unit;
+                        gui->au_audio_unit = nil;
                         gui->view_controller = nil;
                         gui->view = auv2_view;
                         gui->window = nil;
@@ -417,6 +420,7 @@ void rack_au_gui_create_async(
                         NSView* generic_view = create_generic_ui(audio_unit, &targets);
 
                         gui->audio_unit = audio_unit;
+                        gui->au_audio_unit = nil;
                         gui->view_controller = nil;
                         gui->view = generic_view;
                         gui->window = nil;
@@ -449,6 +453,10 @@ void rack_au_gui_destroy(RackAUGui* gui) {
             if (gui->window != nil) {
                 [gui->window close];
                 gui->window = nil;
+            }
+
+            if (gui->au_audio_unit != nil) {
+                gui->au_audio_unit = nil;  // Release AUv3 instance after the editor is torn down
             }
 
             // Clean up view controller

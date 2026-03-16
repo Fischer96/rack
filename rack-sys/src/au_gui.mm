@@ -236,6 +236,29 @@ static NSView* create_generic_ui(AudioComponentInstance audio_unit, NSMutableArr
 // AUv3 GUI Loading (Asynchronous)
 // ============================================================================
 
+static AUAudioUnit* try_get_existing_auv3_audio_unit(AudioComponentInstance audio_unit) {
+    if (audio_unit == NULL) {
+        return nil;
+    }
+
+    AUAudioUnit* au_audio_unit = nil;
+    UInt32 data_size = sizeof(au_audio_unit);
+    OSStatus status = AudioUnitGetProperty(
+        audio_unit,
+        kAudioUnitProperty_AUAudioUnit,
+        kAudioUnitScope_Global,
+        0,
+        &au_audio_unit,
+        &data_size
+    );
+
+    if (status != noErr || au_audio_unit == nil) {
+        return nil;
+    }
+
+    return au_audio_unit;
+}
+
 static void sync_auv3_gui_state(
     AudioComponentInstance audio_unit,
     AUAudioUnit* au_audio_unit
@@ -267,46 +290,66 @@ static void sync_auv3_gui_state(
     CFRelease(class_info);
 }
 
+static void try_load_auv3_gui_from_new_instance(
+    AudioComponentInstance audio_unit,
+    void (^completion)(AUViewControllerBase* viewController, AUAudioUnit* auAudioUnit)
+) {
+    // Get the AudioComponent from the instance
+    AudioComponent component = AudioComponentInstanceGetComponent(audio_unit);
+    if (component == NULL) {
+        completion(nil, nil);
+        return;
+    }
+
+    // Get component description to instantiate AUv3
+    AudioComponentDescription desc;
+    if (AudioComponentGetDescription(component, &desc) != noErr) {
+        completion(nil, nil);
+        return;
+    }
+
+    // Try to instantiate as AUv3 (asynchronously)
+    [AUAudioUnit instantiateWithComponentDescription:desc
+                                              options:0
+                                    completionHandler:^(AUAudioUnit* _Nullable auAudioUnit, NSError* _Nullable error) {
+        if (error != nil || auAudioUnit == nil) {
+            // Not an AUv3 plugin or instantiation failed
+            completion(nil, nil);
+            return;
+        }
+
+        // AUv3 editors use a separate AUAudioUnit instance from the live
+        // audio-processing instance. Copy the current ClassInfo state across
+        // before requesting the view so the editor reflects the loaded preset.
+        sync_auv3_gui_state(audio_unit, auAudioUnit);
+
+        // Request view controller asynchronously
+        [auAudioUnit requestViewControllerWithCompletionHandler:^(AUViewControllerBase* _Nullable viewController) {
+            // viewController will be nil if plugin has no GUI
+            completion(viewController, auAudioUnit);
+        }];
+    }];
+}
+
 static void try_load_auv3_gui(
     AudioComponentInstance audio_unit,
     void (^completion)(AUViewControllerBase* viewController, AUAudioUnit* auAudioUnit)
 ) {
     @autoreleasepool {
-        // Get the AudioComponent from the instance
-        AudioComponent component = AudioComponentInstanceGetComponent(audio_unit);
-        if (component == NULL) {
-            completion(nil, nil);
-            return;
-        }
+        AUAudioUnit* existing_au_audio_unit = try_get_existing_auv3_audio_unit(audio_unit);
+        if (existing_au_audio_unit != nil) {
+            [existing_au_audio_unit requestViewControllerWithCompletionHandler:^(AUViewControllerBase* _Nullable viewController) {
+                if (viewController != nil) {
+                    completion(viewController, existing_au_audio_unit);
+                    return;
+                }
 
-        // Get component description to instantiate AUv3
-        AudioComponentDescription desc;
-        if (AudioComponentGetDescription(component, &desc) != noErr) {
-            completion(nil, nil);
-            return;
-        }
-
-        // Try to instantiate as AUv3 (asynchronously)
-        [AUAudioUnit instantiateWithComponentDescription:desc
-                                                  options:0
-                                        completionHandler:^(AUAudioUnit* _Nullable auAudioUnit, NSError* _Nullable error) {
-            if (error != nil || auAudioUnit == nil) {
-                // Not an AUv3 plugin or instantiation failed
-                completion(nil, nil);
-                return;
-            }
-
-            // AUv3 editors use a separate AUAudioUnit instance from the live
-            // audio-processing instance. Copy the current ClassInfo state across
-            // before requesting the view so the editor reflects the loaded preset.
-            sync_auv3_gui_state(audio_unit, auAudioUnit);
-
-            // Request view controller asynchronously
-            [auAudioUnit requestViewControllerWithCompletionHandler:^(AUViewControllerBase* _Nullable viewController) {
-                // viewController will be nil if plugin has no GUI
-                completion(viewController, auAudioUnit);
+                try_load_auv3_gui_from_new_instance(audio_unit, completion);
             }];
-        }];
+            return;
+        }
+
+        try_load_auv3_gui_from_new_instance(audio_unit, completion);
     }
 }
 

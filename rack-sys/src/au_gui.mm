@@ -375,49 +375,53 @@ static NSView* try_load_auv2_gui(AudioComponentInstance audio_unit) {
             &dataSize
         );
 
-        if (status != noErr || viewInfo.mCocoaAUViewBundleLocation == NULL) {
+        if (status != noErr || viewInfo.mCocoaAUViewClass[0] == NULL) {
             return nil;
         }
 
-        // Use @try/@finally to ensure CFRelease happens even if exceptions occur
         NSView* auView = nil;
         @try {
-            // Convert CFURLRef to NSURL
-            // AudioUnitGetProperty returns owned CF objects (Create Rule)
-            // __bridge doesn't transfer ownership to ARC, so manual CFRelease required
-            NSURL* bundleURL = (__bridge NSURL*)viewInfo.mCocoaAUViewBundleLocation;
-            NSBundle* viewBundle = [NSBundle bundleWithURL:bundleURL];
-
-            if (viewBundle == nil) {
-                return nil;
-            }
-
-            // Get view class name
             NSString* viewClassName = (__bridge NSString*)viewInfo.mCocoaAUViewClass[0];
-            Class viewClass = [viewBundle classNamed:viewClassName];
+            Class viewClass = Nil;
 
-            if (viewClass == nil) {
+            if (viewInfo.mCocoaAUViewBundleLocation != NULL) {
+                NSURL* bundleURL = (__bridge NSURL*)viewInfo.mCocoaAUViewBundleLocation;
+                NSBundle* viewBundle = [NSBundle bundleWithURL:bundleURL];
+                if (viewBundle != nil) {
+                    viewClass = [viewBundle classNamed:viewClassName];
+                }
+            }
+
+            if (viewClass == Nil) {
+                viewClass = NSClassFromString(viewClassName);
+            }
+
+            if (viewClass == Nil) {
                 return nil;
             }
 
-            // Create view instance
-            // The view class should have an initWithAudioUnit: method
-            if ([viewClass instancesRespondToSelector:@selector(initWithAudioUnit:)]) {
-                // Use NSInvocation to avoid performSelector warning
+            id instance = [[viewClass alloc] init];
+
+            if ([instance respondsToSelector:@selector(uiViewForAudioUnit:withSize:)]) {
+                SEL selector = @selector(uiViewForAudioUnit:withSize:);
+                typedef NSView* (*FactoryFn)(id, SEL, AudioUnit, NSSize);
+                FactoryFn fn = (FactoryFn)[instance methodForSelector:selector];
+                auView = fn(instance, selector, audio_unit, NSMakeSize(800.0, 600.0));
+            } else if ([viewClass instancesRespondToSelector:@selector(initWithAudioUnit:)]) {
                 SEL selector = @selector(initWithAudioUnit:);
                 NSMethodSignature *signature = [viewClass instanceMethodSignatureForSelector:selector];
                 NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
                 [invocation setSelector:selector];
-                id instance = [[viewClass alloc] init];
                 [invocation setTarget:instance];
-                [invocation setArgument:&audio_unit atIndex:2]; // arg 0 is self, arg 1 is _cmd
+                [invocation setArgument:&audio_unit atIndex:2];
                 [invocation invoke];
                 [invocation getReturnValue:&auView];
             }
         }
         @finally {
-            // Always clean up CoreFoundation objects, even if exception thrown
-            CFRelease(viewInfo.mCocoaAUViewBundleLocation);
+            if (viewInfo.mCocoaAUViewBundleLocation != NULL) {
+                CFRelease(viewInfo.mCocoaAUViewBundleLocation);
+            }
             if (viewInfo.mCocoaAUViewClass[0] != NULL) {
                 CFRelease(viewInfo.mCocoaAUViewClass[0]);
             }
@@ -462,7 +466,26 @@ void rack_au_gui_create_async(
     // Ensure we're on main thread for GUI operations
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
-            // Try AUv3 GUI first (asynchronous)
+            // Prefer classic AUv2 Cocoa UI when available. Many component plugins
+            // expose richer editors there than through the bridged AUAudioUnit view.
+            NSView* auv2_view = try_load_auv2_gui(audio_unit);
+            if (auv2_view != nil) {
+                RackAUGui* gui = new RackAUGui();
+                gui->audio_unit = audio_unit;
+                gui->au_audio_unit = nil;
+                gui->view_controller = nil;
+                gui->view = auv2_view;
+                gui->window = nil;
+                gui->slider_targets = nil;
+                gui->owns_view_controller = false;
+                gui->owns_view = true;
+                gui->error_message[0] = '\0';
+
+                callback(user_data, gui, RACK_AU_OK);
+                return;
+            }
+
+            // Try AUv3 GUI next (asynchronous)
             try_load_auv3_gui(audio_unit, ^(AUViewControllerBase* viewController, AUAudioUnit* auAudioUnit) {
                 if (viewController != nil) {
                     // AUv3 succeeded
@@ -479,41 +502,22 @@ void rack_au_gui_create_async(
 
                     callback(user_data, gui, RACK_AU_OK);
                 } else {
-                    // AUv3 failed, try AUv2
-                    NSView* auv2_view = try_load_auv2_gui(audio_unit);
+                    // Both AUv2 and AUv3 failed, create generic parameter UI as fallback
+                    RackAUGui* gui = new RackAUGui();
+                    NSMutableArray* targets = nil;
+                    NSView* generic_view = create_generic_ui(audio_unit, &targets);
 
-                    if (auv2_view != nil) {
-                        // AUv2 succeeded
-                        RackAUGui* gui = new RackAUGui();
-                        gui->audio_unit = audio_unit;
-                        gui->au_audio_unit = nil;
-                        gui->view_controller = nil;
-                        gui->view = auv2_view;
-                        gui->window = nil;
-                        gui->slider_targets = nil;  // No slider targets for AUv2
-                        gui->owns_view_controller = false;
-                        gui->owns_view = true;
-                        gui->error_message[0] = '\0';
+                    gui->audio_unit = audio_unit;
+                    gui->au_audio_unit = nil;
+                    gui->view_controller = nil;
+                    gui->view = generic_view;
+                    gui->window = nil;
+                    gui->slider_targets = targets;
+                    gui->owns_view_controller = false;
+                    gui->owns_view = true;
+                    gui->error_message[0] = '\0';
 
-                        callback(user_data, gui, RACK_AU_OK);
-                    } else {
-                        // Both AUv3 and AUv2 failed, create generic parameter UI as fallback
-                        RackAUGui* gui = new RackAUGui();
-                        NSMutableArray* targets = nil;
-                        NSView* generic_view = create_generic_ui(audio_unit, &targets);
-
-                        gui->audio_unit = audio_unit;
-                        gui->au_audio_unit = nil;
-                        gui->view_controller = nil;
-                        gui->view = generic_view;
-                        gui->window = nil;
-                        gui->slider_targets = targets;
-                        gui->owns_view_controller = false;
-                        gui->owns_view = true;
-                        gui->error_message[0] = '\0';
-
-                        callback(user_data, gui, RACK_AU_OK);
-                    }
+                    callback(user_data, gui, RACK_AU_OK);
                 }
             });
         }

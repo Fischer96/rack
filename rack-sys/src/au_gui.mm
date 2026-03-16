@@ -236,6 +236,37 @@ static NSView* create_generic_ui(AudioComponentInstance audio_unit, NSMutableArr
 // AUv3 GUI Loading (Asynchronous)
 // ============================================================================
 
+static void sync_auv3_gui_state(
+    AudioComponentInstance audio_unit,
+    AUAudioUnit* au_audio_unit
+) {
+    if (audio_unit == NULL || au_audio_unit == nil) {
+        return;
+    }
+
+    CFPropertyListRef class_info = nullptr;
+    UInt32 data_size = sizeof(class_info);
+    OSStatus status = AudioUnitGetProperty(
+        audio_unit,
+        kAudioUnitProperty_ClassInfo,
+        kAudioUnitScope_Global,
+        0,
+        &class_info,
+        &data_size
+    );
+
+    if (status != noErr || class_info == NULL) {
+        return;
+    }
+
+    if (CFGetTypeID(class_info) == CFDictionaryGetTypeID()) {
+        NSDictionary* state = (__bridge NSDictionary*)class_info;
+        [au_audio_unit setFullState:state];
+    }
+
+    CFRelease(class_info);
+}
+
 static void try_load_auv3_gui(
     AudioComponentInstance audio_unit,
     void (^completion)(AUViewControllerBase* viewController, AUAudioUnit* auAudioUnit)
@@ -264,6 +295,11 @@ static void try_load_auv3_gui(
                 completion(nil, nil);
                 return;
             }
+
+            // AUv3 editors use a separate AUAudioUnit instance from the live
+            // audio-processing instance. Copy the current ClassInfo state across
+            // before requesting the view so the editor reflects the loaded preset.
+            sync_auv3_gui_state(audio_unit, auAudioUnit);
 
             // Request view controller asynchronously
             [auAudioUnit requestViewControllerWithCompletionHandler:^(AUViewControllerBase* _Nullable viewController) {
